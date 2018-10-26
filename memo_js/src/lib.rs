@@ -10,8 +10,12 @@ use std::io;
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use wasm_bindgen::prelude::*;
+use wasm_bindgen::{prelude::*, JsCast};
 use wasm_bindgen_futures::{future_to_promise, JsFuture};
+
+trait JsValueExt {
+    fn into_operation(self) -> Result<memo::Operation, JsValue>;
+}
 
 trait MapJsError<T> {
     fn map_js_err(self) -> Result<T, JsValue>;
@@ -41,13 +45,8 @@ pub struct WorkTreeNewResult {
     operations: Option<StreamToAsyncIterator>,
 }
 
-#[derive(Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct OperationEnvelope {
-    epoch_timestamp: u64,
-    epoch_replica_id: memo::ReplicaId,
-    operation: Base64<memo::Operation>,
-}
+#[wasm_bindgen]
+pub struct OperationEnvelope(memo::Operation);
 
 #[derive(Copy, Clone, Serialize, Deserialize)]
 struct EditRange {
@@ -75,8 +74,6 @@ struct Entry {
 
 pub struct HexOid(memo::Oid);
 
-pub struct Base64<T>(T);
-
 #[wasm_bindgen(module = "./support")]
 extern "C" {
     pub type AsyncIteratorWrapper;
@@ -98,27 +95,32 @@ extern "C" {
     fn text_changed(this: &ChangeObserver, buffer_id: JsValue, changes: JsValue);
 }
 
-#[wasm_bindgen]
+// #[wasm_bindgen]
 impl WorkTree {
     pub fn new(
         git: GitProviderWrapper,
         observer: ChangeObserver,
         replica_id_bytes_slice: &[u8],
         base: JsValue,
-        start_ops: JsValue,
+        js_start_ops: js_sys::Array,
     ) -> Result<WorkTreeNewResult, JsValue> {
         let base = base
             .into_serde::<Option<HexOid>>()
             .map_js_err()?
             .map(|b| b.0);
-        let start_ops: Vec<Base64<memo::Operation>> = start_ops.into_serde().map_js_err()?;
+
+        let mut start_ops = Vec::new();
+        for js_op in js_start_ops.values() {
+            start_ops.push(js_op?.into_operation()?);
+        }
+
         let mut replica_id_bytes = [0; 16];
         replica_id_bytes.copy_from_slice(replica_id_bytes_slice);
         let replica_id = memo::ReplicaId::from_random_bytes(replica_id_bytes);
         let (tree, operations) = memo::WorkTree::new(
             replica_id,
             base,
-            start_ops.into_iter().map(|op| op.0),
+            start_ops,
             Rc::new(git),
             Some(Rc::new(observer)),
         )
@@ -127,7 +129,7 @@ impl WorkTree {
             tree: Some(WorkTree(tree)),
             operations: Some(StreamToAsyncIterator::new(
                 operations
-                    .map(|op| OperationEnvelope::new(op))
+                    .map(|op| JsValue::from(OperationEnvelope::new(op)))
                     .map_err(|err| err.to_string()),
             )),
         })
@@ -146,11 +148,11 @@ impl WorkTree {
         ))
     }
 
-    pub fn apply_ops(&mut self, ops: JsValue) -> Result<StreamToAsyncIterator, JsValue> {
-        let ops = ops
-            .into_serde::<Vec<Base64<memo::Operation>>>()
-            .map(|ops| ops.into_iter().map(|Base64(op)| op.clone()))
-            .map_js_err()?;
+    pub fn apply_ops(&mut self, js_ops: js_sys::Array) -> Result<StreamToAsyncIterator, JsValue> {
+        let mut ops = Vec::new();
+        for js_op in js_ops.values() {
+            ops.push(js_op?.into_operation()?);
+        }
 
         self.0
             .apply_ops(ops)
@@ -265,7 +267,7 @@ impl OperationEnvelope {
         Self {
             epoch_timestamp: epoch_id.value,
             epoch_replica_id: epoch_id.replica_id,
-            operation: Base64(operation),
+            operation: bincode::serialize(&operation).unwrap().into_boxed_slice(),
         }
     }
 }
@@ -309,11 +311,11 @@ impl StreamToAsyncIterator {
     fn new<E, S, T>(stream: S) -> Self
     where
         E: Serialize,
-        S: 'static + Stream<Item = T, Error = E>,
-        T: Serialize,
+        S: 'static + Stream<Item = JsValue, Error = E>,
     {
         let js_value_stream = stream
             .map(|value| {
+                Reflect::new();
                 JsValue::from_serde(&AsyncResult {
                     value: Some(value),
                     done: false,
@@ -416,33 +418,22 @@ impl<'de> Deserialize<'de> for HexOid {
     }
 }
 
-impl<T: Serialize> Serialize for Base64<T> {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        use serde::ser::Error;
-        base64::encode(&bincode::serialize(&self.0).map_err(Error::custom)?).serialize(serializer)
-    }
-}
-
-impl<'de1, T: for<'de2> Deserialize<'de2>> Deserialize<'de1> for Base64<T> {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de1>,
-    {
-        use serde::de::Error;
-        let bytes = base64::decode(&String::deserialize(deserializer)?).map_err(Error::custom)?;
-        let inner = bincode::deserialize::<T>(&bytes).map_err(D::Error::custom)?;
-        Ok(Base64(inner))
-    }
-}
-
 impl<T, E> MapJsError<T> for Result<T, E>
 where
     E: ToString,
 {
     fn map_js_err(self) -> Result<T, JsValue> {
         self.map_err(|err| JsValue::from(err.to_string()))
+    }
+}
+
+impl JsValueExt for JsValue {
+    fn into_operation(self) -> Result<memo::Operation, JsValue> {
+        let js_bytes = self
+            .dyn_into::<js_sys::Uint8Array>()
+            .map_err(|_| JsValue::from_str("Operation must be Uint8Array"))?;
+        let mut bytes = Vec::with_capacity(js_bytes.byte_length() as usize);
+        js_bytes.for_each(&mut |byte, _, _| bytes.push(byte));
+        bincode::deserialize(&bytes).map_js_err()
     }
 }

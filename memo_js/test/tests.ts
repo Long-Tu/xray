@@ -26,6 +26,9 @@ suite("WorkTree", () => {
     ]);
 
     const [tree1, initOps1] = WorkTree.create(OID_0, [], git);
+    let x = await collectOps(initOps1);
+    console.log(x[0].constructor);
+    return;
     const [tree2, initOps2] = WorkTree.create(
       OID_0,
       await collectOps(initOps1),
